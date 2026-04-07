@@ -45,6 +45,7 @@ logger.addHandler(log_buffer)
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
 VERTEX_KEY = os.getenv("VERTEX_KEY")
+init_project = PROJECT_ID # Default
 
 try:
     if VERTEX_KEY:
@@ -526,14 +527,25 @@ async def chat_vertex(request: ChatRequest):
                 }
             except Exception as e:
                 last_exception = e
-                if "404" in str(e) or "not found" in str(e).lower():
-                    logger.warning(f"Model {model_name} not found in Vertex AI, trying next fallback...")
+                error_str = str(e).lower()
+                if "404" in error_str or "not found" in error_str:
+                    logger.warning(f"Model {model_name} not found in Vertex AI (Project: {init_project}, Location: {LOCATION}). Trying next fallback...")
                     continue
                 else:
                     # If it's not a 404, it might be a different issue (auth, quota), so we stop
                     break
         
         if last_exception:
+            error_msg = str(last_exception)
+            if "404" in error_msg or "not found" in error_msg.lower():
+                # Provide a very specific error message for 404s
+                helpful_msg = (
+                    f"Vertex AI Error: Model not found (404). This usually means the 'Vertex AI API' is not enabled "
+                    f"for project '{init_project}' or the model is not available in region '{LOCATION}'. "
+                    f"Please enable the API at: https://console.cloud.google.com/apis/library/aiplatform.googleapis.com?project={init_project}"
+                )
+                logger.error(helpful_msg)
+                raise HTTPException(status_code=404, detail=helpful_msg)
             raise last_exception
     except Exception as e:
         import traceback

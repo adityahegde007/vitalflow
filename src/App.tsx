@@ -318,7 +318,11 @@ export default function App() {
             system_instruction: SYSTEM_INSTRUCTION
           })
         });
-        if (!res.ok) throw new Error(`Vertex AI Error: ${res.statusText}`);
+        
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({ detail: res.statusText }));
+          throw new Error(errorData.detail || `Vertex AI Error: ${res.statusText}`);
+        }
         response = await res.json();
       } else {
         if (!chat) throw new Error("401: Gemini API Key is missing or invalid.");
@@ -516,6 +520,16 @@ export default function App() {
             </button>
           ))}
         </div>
+
+        {isApiKeyMissing && (
+          <div className="bg-amber-50 border-b border-amber-100 p-3 flex items-center gap-3 text-amber-800 text-xs font-medium">
+            <AlertCircle className="w-4 h-4 text-amber-500" />
+            <span>
+              Gemini API Key missing. Using Vertex AI backend fallback. 
+              <span className="ml-1 font-normal opacity-75">Ensure Vertex AI API is enabled in your Google Cloud Project.</span>
+            </span>
+          </div>
+        )}
 
         {/* Persona Responsibilities Header */}
         <div className="p-6 bg-white border-b border-gray-100">
