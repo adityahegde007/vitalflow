@@ -1,24 +1,34 @@
-# Stage 1: Build the React frontend
-FROM node:20-slim AS build-frontend
+# Use Python 3.10 as base image
+FROM python:3.10-slim
+
+# Install Node.js for building the frontend
+RUN apt-get update && apt-get install -y \
+    curl \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
 WORKDIR /app
+
+# Copy package files and install dependencies
 COPY package*.json ./
 RUN npm install
-COPY . ./
-RUN npm run build
 
-# Stage 2: Build the Python backend and serve the frontend
-FROM python:3.10-slim
-ENV PYTHONUNBUFFERED True
-ENV APP_HOME /app
-WORKDIR $APP_HOME
-
-# Install production dependencies.
+# Copy requirements and install Python dependencies
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the backend code and the built frontend from Stage 1
-COPY . ./
-COPY --from=build-frontend /app/dist ./dist
+# Copy the rest of the application
+COPY . .
 
-# Run the web service on container startup.
-CMD exec uvicorn main:app --host 0.0.0.0 --port 3000
+# Build the frontend
+RUN npm run build
+
+# Expose the port Cloud Run will use
+ENV PORT 8080
+EXPOSE 8080
+
+# Start the application
+# We use uvicorn directly to serve the FastAPI app which also serves the static files
+CMD ["python3", "main.py"]

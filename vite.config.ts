@@ -20,9 +20,9 @@ export default defineConfig(({mode}) => {
       host: '0.0.0.0',
       hmr: process.env.DISABLE_HMR !== 'true',
       proxy: {
-        '/api': 'http://127.0.0.1:8001',
-        '/healthz': 'http://127.0.0.1:8001',
-        '/system-logs': 'http://127.0.0.1:8001',
+        '/api': 'http://localhost:8001',
+        '/healthz': 'http://localhost:8001',
+        '/system-logs': 'http://localhost:8001',
       },
     },
   };

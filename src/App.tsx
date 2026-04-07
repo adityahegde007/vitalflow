@@ -35,10 +35,11 @@ You are the "VitalFlow Care Orchestrator," a Multi-Agent Primary Coordinator bui
 
 ### OPERATIONAL WORKFLOW
 - PHASE 1 (Assessment): When a patient provides an update, immediately invoke the CLINICAL ANALYST to cross-reference symptoms with AlloyDB records (via get_patient_history) and stored recovery notes (via get_recovery_protocol). You MUST call these tools first.
-- PHASE 2 (Decision): 
+- PHASE 2 (Memory & Context): If the user asks about previous symptoms, logs, or "what happened before," you MUST use the 'get_action_logs' tool to retrieve the patient's history from the database. This is your primary memory mechanism.
+- PHASE 3 (Decision): 
     - If symptoms are "NORMAL": Reassure the patient and log the status in AlloyDB.
     - If symptoms are "CONCERNING": Invoke the LOGISTICS OFFICER to find the next available slot in the Service Account Calendar and create a Nurse-Alert task.
-- PHASE 3 (Audit): Every action, tool call, and decision MUST be logged as a structured entry in the 'action_logs' table in AlloyDB.
+- PHASE 4 (Audit): Every action, tool call, and decision MUST be logged as a structured entry in the 'action_logs' table in AlloyDB.
 
 ### MOCK DATA CONSTRAINTS (For Jury Demo)
 - Only process Patient IDs 100-110.
@@ -68,6 +69,18 @@ const tools = [
           type: Type.OBJECT,
           properties: {
             patient_id: { type: Type.STRING, description: "The ID of the patient (100-110)." }
+          },
+          required: ["patient_id"]
+        }
+      },
+      {
+        name: "get_action_logs",
+        description: "Retrieves the most recent action logs for a specific patient from AlloyDB. Use this to 'remember' what the patient previously reported.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            patient_id: { type: Type.STRING, description: "The ID of the patient (100-110)." },
+            limit: { type: Type.NUMBER, description: "Number of logs to retrieve (default 5)." }
           },
           required: ["patient_id"]
         }
@@ -106,6 +119,8 @@ interface ActionLog {
   created_at: string;
 }
 
+type Persona = "ORCHESTRATOR" | "CLINICAL_ANALYST" | "LOGISTICS_OFFICER";
+
 export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -133,7 +148,8 @@ export default function App() {
   const [logs, setLogs] = useState<ActionLog[]>([]);
   const [logsError, setLogsError] = useState<string | null>(null);
   const [systemLogs, setSystemLogs] = useState<string[]>([]);
-  const [activeAgent, setActiveAgent] = useState<"ORCHESTRATOR" | "CLINICAL_ANALYST" | "LOGISTICS_OFFICER">("ORCHESTRATOR");
+  const [activeAgent, setActiveAgent] = useState<Persona>("ORCHESTRATOR");
+  const [activeTab, setActiveTab] = useState<Persona>("ORCHESTRATOR");
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -145,7 +161,7 @@ export default function App() {
   const chat = useMemo(() => {
     if (isApiKeyMissing) return null;
     return ai.chats.create({
-      model: "gemini-3-flash-preview",
+      model: "gemini-2.0-flash",
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
         tools: tools
@@ -166,9 +182,7 @@ export default function App() {
         let res = await fetch("/api/health");
         let text = await res.text().catch(() => "No response body");
         
-        // If /api/health fails with 401, try /healthz (no prefix)
         if (!res.ok && res.status === 401) {
-          console.warn("API health check 401, trying /healthz...");
           const res2 = await fetch("/healthz");
           if (res2.ok) {
             const data = await res2.json();
@@ -179,7 +193,6 @@ export default function App() {
             }));
             return;
           }
-          // If both fail, show the original 401
         }
 
         if (!res.ok) {
@@ -197,7 +210,6 @@ export default function App() {
           dbType: data.database || "Unknown"
         }));
       } catch (e: any) {
-        console.error("Health check failed:", e);
         setSystemStatus(prev => ({ ...prev, db: "offline", dbType: e.message || "Connection Failed" }));
       }
     };
@@ -213,7 +225,6 @@ export default function App() {
           setLogsError(`Server Error: ${res.status}`);
         }
       } catch (e) {
-        console.error("Failed to fetch logs:", e);
         setLogsError("Network Error: Failed to reach backend.");
       }
     };
@@ -229,11 +240,8 @@ export default function App() {
           } else if (data.error) {
             setProtocolError(data.error);
           }
-        } else {
-          setProtocolError(`Server Error: ${res.status}`);
         }
       } catch (e) {
-        console.error("Failed to fetch protocol:", e);
         setProtocolError("Network Error: Failed to reach backend.");
       }
     };
@@ -246,14 +254,9 @@ export default function App() {
           if (data.availability) {
             setCalendarSlots(data.availability);
             setCalendarError(null);
-          } else if (data.message) {
-            setCalendarError(data.message);
           }
-        } else {
-          setCalendarError(`Server Error: ${res.status}`);
         }
       } catch (e) {
-        console.error("Failed to fetch calendar:", e);
         setCalendarError("Network Error: Failed to reach backend.");
       }
     };
@@ -265,9 +268,7 @@ export default function App() {
           const data = await res.json();
           setSystemLogs(data.logs || []);
         }
-      } catch (e) {
-        console.error("Failed to fetch system logs:", e);
-      }
+      } catch (e) {}
     };
 
     const init = () => {
@@ -282,7 +283,7 @@ export default function App() {
     const interval = setInterval(() => {
       fetchLogs();
       fetchSystemLogs();
-    }, 5000); // Poll for logs
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -301,13 +302,29 @@ export default function App() {
     setActiveAgent("ORCHESTRATOR");
 
     try {
-      if (isApiKeyMissing || !chat) {
-        throw new Error("401: Gemini API Key is missing or invalid. Please check your environment variables.");
-      }
-
-      let response = await chat.sendMessage({ message: input });
+      let response;
       
-      // Handle Tool Calls
+      // Check if we should use Vertex AI backend
+      const useVertex = !!import.meta.env.VITE_USE_VERTEX || isApiKeyMissing;
+      
+      if (useVertex) {
+        setActiveAgent("ORCHESTRATOR");
+        const res = await fetch("/api/chat/vertex", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: input,
+            history: messages.map(m => ({ role: m.role, content: m.text })),
+            system_instruction: SYSTEM_INSTRUCTION
+          })
+        });
+        if (!res.ok) throw new Error(`Vertex AI Error: ${res.statusText}`);
+        response = await res.json();
+      } else {
+        if (!chat) throw new Error("401: Gemini API Key is missing or invalid.");
+        response = await chat.sendMessage({ message: input });
+      }
+      
       let functionCalls = response.functionCalls;
       while (functionCalls) {
         const toolResults = await Promise.all(functionCalls.map(async (call) => {
@@ -327,6 +344,10 @@ export default function App() {
             const res = await fetch(`/api/tools/patient-history/${call.args.patient_id}`);
             result = await res.json();
             setPatientHistory(result);
+          } else if (call.name === "get_action_logs") {
+            setActiveAgent("ORCHESTRATOR");
+            const res = await fetch(`/api/tools/action-logs/${call.args.patient_id}?limit=${call.args.limit || 5}`);
+            result = await res.json();
           } else if (call.name === "update_patient_task") {
             setActiveAgent("LOGISTICS_OFFICER");
             const res = await fetch("/api/tools/log-task", {
@@ -361,7 +382,6 @@ export default function App() {
       }]);
       setActiveAgent("ORCHESTRATOR");
     } catch (error: any) {
-      console.error("Gemini Error:", error);
       const errorMessage = error.message?.includes("401") 
         ? "AUTHENTICATION ERROR (401): Gemini API Key is missing or invalid. Please check your environment variables."
         : "ORCHESTRATION ERROR: Unable to process clinical reasoning.";
@@ -376,53 +396,91 @@ export default function App() {
     }
   };
 
+  const personaDetails = {
+    ORCHESTRATOR: {
+      title: "VitalFlow Orchestrator",
+      icon: <Zap className="w-5 h-5" />,
+      responsibilities: [
+        "Primary interface for patient communication",
+        "Coordinates sub-agents and tool execution",
+        "Maintains system-wide context and memory",
+        "Enforces safety protocols and critical alarms"
+      ],
+      color: "bg-blue-600"
+    },
+    CLINICAL_ANALYST: {
+      title: "Clinical Analyst",
+      icon: <Activity className="w-5 h-5" />,
+      responsibilities: [
+        "Analyzes patient history and recovery protocols",
+        "Identifies concerning symptoms and trends",
+        "Cross-references data with clinical guidelines",
+        "Provides medical reasoning to the Orchestrator"
+      ],
+      color: "bg-emerald-600"
+    },
+    LOGISTICS_OFFICER: {
+      title: "Logistics Officer",
+      icon: <ClipboardList className="w-5 h-5" />,
+      responsibilities: [
+        "Manages scheduling and calendar availability",
+        "Logs patient tasks and assessment results",
+        "Triggers nurse alerts and follow-up actions",
+        "Handles data persistence in AlloyDB"
+      ],
+      color: "bg-amber-600"
+    }
+  };
+
   return (
-    <div className="flex h-screen overflow-hidden bg-[#E4E3E0] text-[#141414] font-sans">
+    <div className="flex h-screen overflow-hidden bg-[#F8F9FA] text-[#1A1A1A] font-sans">
       {/* Sidebar - Technical Control Panel */}
-      <aside className="w-72 border-r border-[#141414] flex flex-col bg-white shrink-0">
-        <div className="p-6 border-b border-[#141414]">
-          <div className="flex items-center gap-2 mb-1">
-            <Activity className="w-5 h-5 text-blue-600" />
-            <h1 className="font-bold tracking-tighter text-xl uppercase">VitalFlow</h1>
+      <aside className="w-80 border-r border-gray-200 flex flex-col bg-white shrink-0 shadow-sm">
+        <div className="p-6 border-b border-gray-100">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 bg-blue-600 rounded-lg">
+              <Activity className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="font-bold tracking-tight text-xl">VitalFlow</h1>
+              <p className="text-[10px] font-mono text-gray-400 uppercase tracking-widest">Care Orchestration 2.5</p>
+            </div>
           </div>
-          <p className="mono-label">Care Orchestration v2.5</p>
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {/* Patient Context */}
-          <section className="p-6 border-b border-[#141414]">
-            <h2 className="italic-header mb-4">Patient Identity</h2>
-            <div className="flex items-center gap-3 p-3 border border-[#141414] bg-[#F5F5F5]">
-              <div className="w-10 h-10 bg-[#141414] flex items-center justify-center text-white">
-                <User className="w-5 h-5" />
+          <section className="p-6 border-b border-gray-100">
+            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Patient Identity</h2>
+            <div className="flex items-center gap-4 p-4 rounded-xl bg-gray-50 border border-gray-100">
+              <div className="w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-gray-600">
+                <User className="w-6 h-6" />
               </div>
               <div>
-                <p className="mono-label">Active ID</p>
-                <p className="font-mono font-bold">{patientId || "NOT_SET"}</p>
+                <p className="text-[10px] font-mono text-gray-400">Active Session ID</p>
+                <p className="font-mono font-bold text-lg">{patientId || "---"}</p>
               </div>
             </div>
           </section>
 
           {/* System Status */}
-          <section className="p-6 border-b border-[#141414]">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="italic-header">Core Systems</h2>
-            </div>
+          <section className="p-6 border-b border-gray-100">
+            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Core Systems</h2>
             <div className="space-y-3">
               <StatusItem 
                 icon={<Database className="w-4 h-4" />} 
-                label="Database" 
+                label="AlloyDB" 
                 status={systemStatus.db} 
                 subtext={systemStatus.dbType}
               />
-              <StatusItem icon={<Cpu className="w-4 h-4" />} label="Gemini SDK" status={systemStatus.ai} />
+              <StatusItem icon={<Cpu className="w-4 h-4" />} label="Gemini 3.0" status={systemStatus.ai} />
               <StatusItem icon={<Calendar className="w-4 h-4" />} label="MCP Calendar" status={systemStatus.calendar} />
             </div>
           </section>
 
           {/* Agent Dispatch Monitor */}
-          <section className="p-6 border-b border-[#141414]">
-            <h2 className="italic-header mb-4">Agent Dispatch</h2>
+          <section className="p-6">
+            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Active Dispatch</h2>
             <div className="space-y-2">
               <AgentNode label="Orchestrator" active={activeAgent === "ORCHESTRATOR"} />
               <AgentNode label="Clinical Analyst" active={activeAgent === "CLINICAL_ANALYST"} />
@@ -431,32 +489,62 @@ export default function App() {
           </section>
         </div>
 
-        <div className="p-6 border-t border-[#141414] bg-[#F5F5F5]">
-          <div className="flex items-center gap-2 text-xs opacity-50 font-mono">
-            <Info className="w-3 h-3" />
-            <span>APAC 2026 DEMO BUILD</span>
+        <div className="p-6 border-t border-gray-100 bg-gray-50">
+          <div className="flex items-center gap-2 text-[10px] text-gray-400 font-mono">
+            <ShieldCheck className="w-3 h-3" />
+            <span>HIPAA COMPLIANT MODE</span>
           </div>
         </div>
       </aside>
 
-      {/* Main Content - Data Grid Chat */}
-      <main className="flex-1 flex flex-col min-w-0 border-r border-[#141414]">
-        {/* Header Bar */}
-        <header className="h-16 border-b border-[#141414] bg-white flex items-center justify-between px-8">
-          <div className="flex items-center gap-4">
-            <LayoutDashboard className="w-4 h-4 opacity-40" />
-            <span className="mono-label">Orchestrator Node</span>
+      {/* Main Content - Persona Tabs & Chat */}
+      <main className="flex-1 flex flex-col min-w-0 bg-white">
+        {/* Persona Tabs */}
+        <div className="flex border-b border-gray-100 bg-gray-50/50">
+          {(Object.keys(personaDetails) as Persona[]).map((p) => (
+            <button
+              key={p}
+              onClick={() => setActiveTab(p)}
+              className={`flex-1 py-4 px-6 text-sm font-medium transition-all border-b-2 flex items-center justify-center gap-2 ${
+                activeTab === p 
+                  ? "border-blue-600 text-blue-600 bg-white shadow-[0_-4px_0_0_inset_white]" 
+                  : "border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+              }`}
+            >
+              {personaDetails[p].icon}
+              <span className="hidden sm:inline">{personaDetails[p].title.split(" ")[0]}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Persona Responsibilities Header */}
+        <div className="p-6 bg-white border-b border-gray-100">
+          <div className="flex items-start justify-between">
+            <div>
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                {personaDetails[activeTab].icon}
+                {personaDetails[activeTab].title}
+              </h2>
+              <p className="text-sm text-gray-500 mt-1">System Responsibilities & Active Protocol</p>
+            </div>
+            <div className={`px-3 py-1 rounded-full text-[10px] font-bold text-white uppercase tracking-widest ${personaDetails[activeTab].color}`}>
+              {activeTab === activeAgent ? "Processing" : "Standby"}
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-            <span className="mono-label">Real-time Sync Active</span>
+          <div className="grid grid-cols-2 gap-4 mt-4">
+            {personaDetails[activeTab].responsibilities.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 text-xs text-gray-600">
+                <CheckCircle2 className="w-3 h-3 text-blue-500" />
+                {r}
+              </div>
+            ))}
           </div>
-        </header>
+        </div>
 
         {/* Message Area */}
         <div 
           ref={scrollRef}
-          className="flex-1 overflow-y-auto p-8 space-y-6 bg-white/50"
+          className="flex-1 overflow-y-auto p-8 space-y-8 bg-[#F8F9FA]/50"
         >
           <AnimatePresence initial={false}>
             {messages.map((msg, idx) => (
@@ -464,201 +552,148 @@ export default function App() {
                 key={idx}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
+                className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                <div className="flex items-center gap-2 mb-1 px-1">
-                  <span className="mono-label">{msg.role === "user" ? "Patient" : "Orchestrator"}</span>
-                  <span className="text-[10px] opacity-30 font-mono">{msg.timestamp}</span>
-                </div>
-                
-                <div className={`
-                  max-w-[90%] p-4 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,0.1)]
-                  ${msg.role === "user" ? "bg-white" : "bg-[#141414] text-white"}
-                  ${msg.isCritical ? "border-red-500 ring-2 ring-red-500/20" : ""}
-                `}>
-                  {msg.isCritical && (
-                    <div className="flex items-center gap-2 text-red-400 mb-2 font-bold text-xs uppercase tracking-widest">
-                      <AlertCircle className="w-4 h-4" />
-                      Critical Alarm
+                <div className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"} max-w-[80%]`}>
+                  <div className="flex items-center gap-2 mb-2 px-1">
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                      {msg.role === "user" ? "Patient" : "VitalFlow AI"}
+                    </span>
+                    <span className="text-[10px] text-gray-300 font-mono">{msg.timestamp}</span>
+                  </div>
+                  
+                  <div className={`
+                    p-5 rounded-2xl shadow-sm border
+                    ${msg.role === "user" 
+                      ? "bg-blue-600 text-white border-blue-700 rounded-tr-none" 
+                      : "bg-white text-gray-800 border-gray-100 rounded-tl-none"}
+                    ${msg.isCritical ? "ring-4 ring-red-500/20 border-red-500" : ""}
+                  `}>
+                    {msg.isCritical && (
+                      <div className="flex items-center gap-2 text-red-500 mb-3 font-bold text-xs uppercase tracking-widest">
+                        <AlertCircle className="w-4 h-4" />
+                        Critical Medical Alert
+                      </div>
+                    )}
+                    <div className={`prose prose-sm max-w-none ${msg.role === "user" ? "prose-invert" : ""}`}>
+                      <Markdown>{msg.text}</Markdown>
                     </div>
-                  )}
-                  <div className="prose prose-sm prose-invert max-w-none">
-                    <Markdown>{msg.text}</Markdown>
                   </div>
                 </div>
               </motion.div>
             ))}
           </AnimatePresence>
           {isLoading && (
-            <div className="flex items-center gap-3 text-[#141414] opacity-40">
-              <Activity className="w-4 h-4 animate-spin" />
-              <span className="mono-label">Dispatching Sub-Agents...</span>
+            <div className="flex items-center gap-3 text-blue-600">
+              <div className="flex gap-1">
+                <div className="w-1.5 h-1.5 bg-blue-600 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                <div className="w-1.5 h-1.5 bg-blue-600 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                <div className="w-1.5 h-1.5 bg-blue-600 rounded-full animate-bounce"></div>
+              </div>
+              <span className="text-[10px] font-bold uppercase tracking-widest">Agent {activeAgent.replace("_", " ")} Processing...</span>
             </div>
           )}
         </div>
 
         {/* Input Area */}
-        <div className="p-8 bg-white border-t border-[#141414]">
+        <div className="p-6 bg-white border-t border-gray-100">
           <form 
             onSubmit={(e) => { e.preventDefault(); handleSend(); }} 
-            className="relative"
+            className="flex gap-4"
           >
-            <div className="absolute left-4 top-1/2 -translate-y-1/2 text-[#141414] opacity-30">
-              <Terminal className="w-4 h-4" />
+            <div className="relative flex-1">
+              <div className="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400">
+                <Terminal className="w-4 h-4" />
+              </div>
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your health update or question..."
+                className="w-full p-4 pl-12 pr-4 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all text-sm"
+              />
             </div>
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              placeholder="Enter patient update or symptom report..."
-              className="w-full p-4 pl-12 pr-16 border border-[#141414] bg-[#F5F5F5] focus:outline-none focus:ring-2 focus:ring-blue-500/20 font-mono text-sm"
-            />
             <button
               onClick={handleSend}
               disabled={isLoading || !input.trim()}
-              className="absolute right-2 top-2 bottom-2 px-4 bg-[#141414] text-white hover:bg-blue-600 transition-colors disabled:opacity-50"
+              className="p-4 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-all disabled:opacity-50 shadow-lg shadow-blue-500/20"
             >
-              <Send className="w-4 h-4" />
+              <Send className="w-5 h-5" />
             </button>
           </form>
-          <div className="mt-3 flex gap-4">
+          <div className="mt-4 flex flex-wrap gap-2">
             <QuickAction label="Check Protocol" onClick={() => setInput("What is the recovery protocol?")} />
             <QuickAction label="Check Calendar" onClick={() => setInput("Check my follow-up availability")} />
             <QuickAction label="Log Symptom" onClick={() => setInput("I have a slight fever (Patient 101)")} />
+            <QuickAction label="Recall History" onClick={() => setInput("What symptoms did I report earlier?")} />
           </div>
         </div>
       </main>
 
       {/* Right Sidebar - Live Context Feed */}
-      <aside className="w-96 flex flex-col bg-white shrink-0">
-        <header className="h-16 border-b border-[#141414] flex items-center px-6">
-          <Terminal className="w-4 h-4 mr-2" />
-          <h2 className="font-bold tracking-tighter uppercase text-sm">Live Context Feed</h2>
+      <aside className="w-96 flex flex-col bg-gray-50 shrink-0 border-l border-gray-200">
+        <header className="h-16 border-b border-gray-200 flex items-center px-6 bg-white">
+          <History className="w-4 h-4 mr-2 text-gray-400" />
+          <h2 className="font-bold tracking-tight uppercase text-xs text-gray-500">Clinical Audit Feed</h2>
         </header>
 
-        <div className="flex-1 overflow-y-auto">
-          {/* Patient History (AlloyDB MCP) */}
-          <section className="p-6 border-b border-[#141414]">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="italic-header flex items-center gap-2">
-                <User className="w-4 h-4" /> Patient History
-              </h3>
-              <span className="mono-label text-[10px]">ALLOYDB MCP</span>
-            </div>
-            <div className="p-4 border border-[#141414] bg-[#F5F5F5] min-h-[80px]">
-              {patientHistory ? (
-                <div className="text-xs font-mono space-y-1">
-                  <p><span className="font-bold">Surgery:</span> {patientHistory.surgery}</p>
-                  <p><span className="font-bold">Date:</span> {patientHistory.date}</p>
-                  <p><span className="font-bold">Complications:</span> {patientHistory.complications}</p>
-                </div>
-              ) : (
-                <p className="text-xs opacity-40 italic">No history retrieved yet.</p>
-              )}
-            </div>
-          </section>
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {/* Patient History */}
+          <ContextCard 
+            title="Patient History" 
+            icon={<User className="w-4 h-4" />} 
+            mcp="ALLOYDB"
+            content={patientHistory ? (
+              <div className="text-xs space-y-2">
+                <div className="flex justify-between"><span className="text-gray-400">Surgery:</span> <span className="font-medium">{patientHistory.surgery}</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Date:</span> <span className="font-medium">{patientHistory.date}</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Complications:</span> <span className="font-medium">{patientHistory.complications}</span></div>
+              </div>
+            ) : null}
+          />
 
-          {/* Recovery Protocol (Notes MCP) */}
-          <section className="p-6 border-b border-[#141414]">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="italic-header flex items-center gap-2">
-                <FileText className="w-4 h-4" /> Recovery Protocol
-              </h3>
-              <span className="mono-label text-[10px]">NOTES MCP</span>
-            </div>
-            <div className="p-4 border border-[#141414] bg-[#F5F5F5] min-h-[100px] max-h-[200px] overflow-y-auto">
-              {protocol ? (
-                <div className="prose prose-xs">
-                  <Markdown>{protocol}</Markdown>
-                </div>
-              ) : protocolError ? (
-                <p className="text-xs text-red-600 italic">{protocolError}</p>
-              ) : (
-                <p className="text-xs opacity-40 italic">No protocol data retrieved yet.</p>
-              )}
-            </div>
-          </section>
+          {/* Recovery Protocol */}
+          <ContextCard 
+            title="Recovery Protocol" 
+            icon={<FileText className="w-4 h-4" />} 
+            mcp="NOTES"
+            content={protocol ? (
+              <div className="prose prose-xs max-h-40 overflow-y-auto">
+                <Markdown>{protocol}</Markdown>
+              </div>
+            ) : null}
+          />
 
-          {/* Calendar Slots (Calendar MCP) */}
-          <section className="p-6 border-b border-[#141414]">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="italic-header flex items-center gap-2">
-                <Calendar className="w-4 h-4" /> Follow-up Slots
-              </h3>
-              <span className="mono-label text-[10px]">CALENDAR MCP</span>
-            </div>
-            <div className="space-y-2">
-              {calendarSlots.length > 0 ? (
-                calendarSlots.map((slot, i) => (
-                  <div key={i} className="flex items-center justify-between p-2 border border-[#141414] bg-white">
-                    <span className="text-xs font-mono">{new Date(slot).toLocaleString()}</span>
-                    <ArrowRight className="w-3 h-3 opacity-30" />
-                  </div>
-                ))
-              ) : calendarError ? (
-                <p className="text-xs text-red-600 italic">{calendarError}</p>
-              ) : (
-                <p className="text-xs opacity-40 italic">No availability checked.</p>
-              )}
-            </div>
-          </section>
-
-          {/* Audit Trail (AlloyDB MCP) */}
-          <section className="p-6 border-b border-[#141414]">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="italic-header flex items-center gap-2">
-                <History className="w-4 h-4" /> Audit Trail
-              </h3>
-              <span className="mono-label text-[10px]">ALLOYDB MCP</span>
+          {/* Audit Trail */}
+          <section className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Audit Trail</h3>
+              <span className="text-[9px] font-mono text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">LIVE</span>
             </div>
             <div className="space-y-3">
               {logs.length > 0 ? (
                 logs.map((log) => (
-                  <div key={log.id} className="p-3 border border-[#141414] bg-[#F5F5F5] relative overflow-hidden">
-                    <div className="flex justify-between items-start mb-1">
-                      <span className="text-[10px] font-bold uppercase tracking-widest">{log.action}</span>
-                      <span className="text-[9px] opacity-40 font-mono">{new Date(log.created_at).toLocaleTimeString()}</span>
+                  <div key={log.id} className="p-4 rounded-xl bg-white border border-gray-100 shadow-sm relative overflow-hidden group">
+                    <div className="flex justify-between items-start mb-2">
+                      <span className="text-[10px] font-bold text-blue-600 uppercase tracking-widest">{log.action}</span>
+                      <span className="text-[9px] text-gray-300 font-mono">{new Date(log.created_at).toLocaleTimeString()}</span>
                     </div>
-                    <p className="text-[11px] leading-tight mb-1">{log.details}</p>
-                    <div className="flex items-center gap-2">
-                      <span className={`text-[9px] px-1 font-mono ${
-                        log.status === "NORMAL" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                    <p className="text-xs text-gray-600 leading-relaxed mb-3">{log.details}</p>
+                    <div className="flex items-center justify-between">
+                      <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold ${
+                        log.status === "NORMAL" ? "bg-green-50 text-green-600" : "bg-red-50 text-red-600"
                       }`}>
                         {log.status}
                       </span>
-                      <span className="text-[9px] opacity-30 font-mono">PID: {log.patient_id}</span>
+                      <span className="text-[9px] text-gray-300 font-mono">PID: {log.patient_id}</span>
                     </div>
                   </div>
                 ))
-              ) : logsError ? (
-                <div className="p-3 border border-red-200 bg-red-50 text-red-700">
-                  <p className="text-xs font-bold mb-1">CONNECTION ERROR</p>
-                  <p className="text-[10px] leading-tight">{logsError}</p>
+              ) : (
+                <div className="p-8 text-center border-2 border-dashed border-gray-200 rounded-2xl">
+                  <Clock className="w-8 h-8 text-gray-200 mx-auto mb-2" />
+                  <p className="text-xs text-gray-400 italic">Waiting for clinical events...</p>
                 </div>
-              ) : (
-                <p className="text-xs opacity-40 italic">No logs found in database.</p>
-              )}
-            </div>
-          </section>
-
-          {/* System Logs (Debug) */}
-          <section className="p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="italic-header flex items-center gap-2 text-blue-600">
-                <Terminal className="w-4 h-4" /> System Diagnostics
-              </h3>
-              <span className="mono-label text-[10px]">BACKEND LOGS</span>
-            </div>
-            <div className="p-3 border border-[#141414] bg-[#141414] text-[#00FF00] font-mono text-[9px] h-48 overflow-y-auto">
-              {systemLogs.length > 0 ? (
-                systemLogs.map((log, i) => (
-                  <div key={i} className="mb-1 border-b border-white/10 pb-1 last:border-0">
-                    {log}
-                  </div>
-                ))
-              ) : (
-                <p className="opacity-40 italic">Waiting for system logs...</p>
               )}
             </div>
           </section>
@@ -668,37 +703,53 @@ export default function App() {
   );
 }
 
+const ContextCard: React.FC<{ title: string, icon: React.ReactNode, mcp: string, content: React.ReactNode }> = ({ title, icon, mcp, content }) => (
+  <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
+    <div className="px-4 py-3 border-b border-gray-50 flex items-center justify-between bg-gray-50/50">
+      <div className="flex items-center gap-2 text-gray-600">
+        {icon}
+        <span className="text-[10px] font-bold uppercase tracking-widest">{title}</span>
+      </div>
+      <span className="text-[8px] font-mono text-gray-400">{mcp} MCP</span>
+    </div>
+    <div className="p-4">
+      {content || <p className="text-[10px] text-gray-300 italic">No data retrieved yet.</p>}
+    </div>
+  </div>
+);
+
 const StatusItem: React.FC<{ icon: React.ReactNode, label: string, status: string, subtext?: string }> = ({ icon, label, status, subtext }) => (
-  <div className="flex items-center justify-between p-2 border border-[#141414]/10 rounded">
-    <div className="flex items-center gap-2">
-      <span className="opacity-40">{icon}</span>
+  <div className="flex items-center justify-between p-3 rounded-xl border border-gray-50 bg-white shadow-sm">
+    <div className="flex items-center gap-3">
+      <div className="text-gray-400">{icon}</div>
       <div>
-        <p className="text-xs font-medium leading-none">{label}</p>
-        {subtext && <p className="text-[9px] font-mono opacity-40 mt-1">{subtext}</p>}
+        <p className="text-xs font-bold text-gray-700">{label}</p>
+        {subtext && <p className="text-[9px] font-mono text-gray-400 mt-0.5 truncate max-w-[120px]">{subtext}</p>}
       </div>
     </div>
-    <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
-      status === "online" ? "bg-green-100 text-green-700" : 
-      status === "checking" ? "bg-blue-100 text-blue-700" : "bg-red-100 text-red-700"
-    }`}>
-      {status.toUpperCase()}
-    </span>
+    <div className={`w-2 h-2 rounded-full ${
+      status === "online" ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : 
+      status === "checking" ? "bg-blue-500 animate-pulse" : "bg-red-500"
+    }`}></div>
   </div>
 );
 
 const AgentNode: React.FC<{ label: string, active: boolean }> = ({ label, active }) => (
-  <div className={`flex items-center gap-3 p-2 border transition-all ${
-    active ? "border-[#141414] bg-[#141414] text-white" : "border-[#141414]/10 bg-white opacity-40"
+  <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
+    active ? "border-blue-200 bg-blue-50 shadow-sm" : "border-gray-50 bg-white opacity-50"
   }`}>
-    <div className={`w-2 h-2 rounded-full ${active ? "bg-green-400 animate-pulse" : "bg-gray-300"}`}></div>
-    <span className="text-[10px] font-bold uppercase tracking-widest">{label}</span>
+    <div className="flex items-center gap-3">
+      <div className={`w-2 h-2 rounded-full ${active ? "bg-blue-600 animate-pulse" : "bg-gray-300"}`}></div>
+      <span className="text-[10px] font-bold uppercase tracking-widest text-gray-700">{label}</span>
+    </div>
+    {active && <Zap className="w-3 h-3 text-blue-600" />}
   </div>
 );
 
 const QuickAction: React.FC<{ label: string, onClick: () => void }> = ({ label, onClick }) => (
   <button 
     onClick={onClick}
-    className="text-[10px] font-mono uppercase tracking-wider border border-[#141414]/20 px-2 py-1 hover:bg-[#141414] hover:text-white transition-colors"
+    className="text-[10px] font-bold uppercase tracking-wider border border-gray-200 px-3 py-1.5 rounded-lg hover:border-blue-500 hover:text-blue-600 hover:bg-blue-50 transition-all bg-white shadow-sm"
   >
     {label}
   </button>

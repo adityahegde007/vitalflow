@@ -41,18 +41,33 @@ log_buffer = LogBuffer()
 log_buffer.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(log_buffer)
 
-# 1. Initialize Vertex AI (ADC)
+# 1. Initialize Vertex AI
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 LOCATION = os.getenv("GOOGLE_CLOUD_REGION", "us-central1")
+VERTEX_KEY = os.getenv("VERTEX_KEY")
 
 try:
-    if PROJECT_ID:
+    if VERTEX_KEY:
+        # If VERTEX_KEY is a JSON string (Service Account), use it
+        try:
+            key_data = json.loads(VERTEX_KEY)
+            from google.oauth2 import service_account
+            credentials = service_account.Credentials.from_service_account_info(key_data)
+            # Prefer project_id from the key file if it exists, as it's usually the string ID
+            init_project = key_data.get("project_id") or PROJECT_ID
+            vertexai.init(project=init_project, location=LOCATION, credentials=credentials)
+            logger.info(f"Vertex AI initialized with Service Account from VERTEX_KEY for project {init_project}")
+        except json.JSONDecodeError:
+            # If not JSON, assume it's an API Key (though Vertex AI usually uses ADC/Service Accounts)
+            vertexai.init(project=PROJECT_ID, location=LOCATION)
+            logger.info("Vertex AI initialized with ADC (VERTEX_KEY provided but not JSON)")
+    elif PROJECT_ID:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        print(f"INFO: Vertex AI initialized for project {PROJECT_ID}")
+        logger.info(f"Vertex AI initialized for project {PROJECT_ID}")
     else:
-        print("WARNING: GOOGLE_CLOUD_PROJECT not set. Vertex AI might fail.")
+        logger.warning("GOOGLE_CLOUD_PROJECT not set. Vertex AI might fail.")
 except Exception as e:
-    print(f"ERROR: Failed to initialize Vertex AI: {e}")
+    logger.error(f"Failed to initialize Vertex AI: {e}")
 
 # 2. AlloyDB Connectivity (DATABASE_URL or IAM Connector)
 Base = declarative_base()
@@ -77,7 +92,7 @@ def get_db_engine():
         if db_url.startswith("postgresql://"):
             db_url = db_url.replace("postgresql://", "postgresql+pg8000://", 1)
         
-        connect_args = {}
+        connect_args = {"timeout": 10}
         if "sslmode=require" in db_url or "ssl=True" in db_url:
             db_url = db_url.replace("sslmode=require", "").replace("ssl=True", "").replace("??", "?").rstrip("?")
             ctx = ssl.create_default_context()
@@ -86,7 +101,7 @@ def get_db_engine():
             connect_args["ssl_context"] = ctx
         
         try:
-            engine = create_engine(db_url, connect_args=connect_args)
+            engine = create_engine(db_url, connect_args=connect_args, pool_pre_ping=True)
             with engine.connect() as conn:
                 logger.info("Database connection successful via URL")
             return engine, "AlloyDB (URL)"
@@ -111,6 +126,7 @@ def get_db_engine():
             engine = create_engine(
                 "postgresql+pg8000://",
                 creator=getconn,
+                pool_pre_ping=True
             )
             with engine.connect() as conn:
                 logger.info("Database connection successful via IAM Connector")
@@ -197,6 +213,31 @@ def get_patient_history(patient_id: str):
     }
     return history.get(patient_id, {"surgery": "Unknown", "date": "Unknown", "complications": "Unknown"})
 
+def get_action_logs_tool(patient_id: str, limit: int = 5):
+    """Retrieves the most recent action logs for a specific patient from AlloyDB."""
+    db = SessionLocal()
+    try:
+        pid = 0
+        try:
+            pid = int(patient_id)
+        except:
+            return {"error": "Invalid patient ID format. Must be an integer."}
+            
+        logs = db.query(ActionLog).filter(ActionLog.patient_id == pid).order_by(ActionLog.timestamp.desc()).limit(limit).all()
+        return [
+            {
+                "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+                "action": log.agent_action,
+                "status": log.tool_used,
+                "result": log.result
+            }
+            for log in logs
+        ]
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        db.close()
+
 def update_patient_task(patient_id: str, task: str, status: str, details: str):
     """Writes to the AlloyDB 'action_logs' table."""
     db = SessionLocal()
@@ -263,6 +304,11 @@ def tool_protocol():
 def tool_patient_history(patient_id: str):
     """Tool: Retrieve patient history."""
     return get_patient_history(patient_id)
+
+@app.get("/api/tools/action-logs/{patient_id}")
+def tool_action_logs(patient_id: str, limit: int = 5):
+    """Tool: Retrieve recent action logs for a patient."""
+    return get_action_logs_tool(patient_id, limit)
 
 class TaskRequest(BaseModel):
     patient_id: str
@@ -429,10 +475,76 @@ if os.path.exists(dist_path):
         # Fallback to index.html for SPA routing
         return FileResponse(os.path.join(dist_path, "index.html"))
 
+# 6. Vertex AI Chat Endpoint
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    history: List[ChatMessage]
+    message: str
+    system_instruction: Optional[str] = None
+
+@app.post("/api/chat/vertex")
+async def chat_vertex(request: ChatRequest):
+    """
+    Backend proxy for Vertex AI Gemini calls.
+    This allows using Vertex AI with Service Account credentials securely.
+    """
+    try:
+        from vertexai.generative_models import Content, Part
+        
+        # Try Gemini 2.0 Flash first, then fallback to 1.5
+        model_names = ["gemini-2.0-flash", "gemini-2.0-flash-001", "gemini-1.5-flash-002", "gemini-1.5-flash"]
+        
+        last_exception = None
+        for model_name in model_names:
+            try:
+                logger.info(f"Attempting to use Vertex AI model: {model_name}")
+                model = GenerativeModel(
+                    model_name,
+                    system_instruction=[request.system_instruction] if request.system_instruction else None
+                )
+                
+                history = []
+                for msg in request.history:
+                    history.append(Content(role="user" if msg.role == "user" else "model", parts=[Part.from_text(msg.content)]))
+                
+                chat = model.start_chat(history=history)
+                response = chat.send_message(request.message)
+                
+                return {
+                    "text": response.text,
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": response.text}]
+                            }
+                        }
+                    ],
+                    "model_used": model_name
+                }
+            except Exception as e:
+                last_exception = e
+                if "404" in str(e) or "not found" in str(e).lower():
+                    logger.warning(f"Model {model_name} not found in Vertex AI, trying next fallback...")
+                    continue
+                else:
+                    # If it's not a 404, it might be a different issue (auth, quota), so we stop
+                    break
+        
+        if last_exception:
+            raise last_exception
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Vertex AI Error: {e}\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Vertex AI Error: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
-    # In AI Studio, PORT is usually 3000. 
-    # We want the backend to run on a different port (8000) so Vite can proxy to it from 3000.
-    backend_port = 8001
-    logger.info(f"Starting backend on port {backend_port}")
-    uvicorn.run(app, host="0.0.0.0", port=backend_port)
+    # Use the PORT environment variable if available (defaulting to 8001 for local dev)
+    # Cloud Run provides the PORT environment variable
+    port = int(os.getenv("PORT", 8001))
+    logger.info(f"Starting backend on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
