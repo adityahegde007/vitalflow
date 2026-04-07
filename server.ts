@@ -14,7 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000; // Vite will run on 3000, but we'll use this for the unified server
+const PORT = parseInt(process.env.PORT || '3000', 10); // Vite will run on 3000, but we'll use this for the unified server
 
 app.use(cors());
 app.use(express.json());
@@ -23,14 +23,38 @@ app.use(express.json());
 let dbType = "Unknown";
 let query: (text: string, params?: any[]) => Promise<any>;
 
+function normalizeDatabaseUrlForPg(rawUrl: string): { normalizedUrl: string; useInsecureTlsFallback: boolean } {
+  try {
+    const parsed = new URL(rawUrl);
+    const sslmode = parsed.searchParams.get("sslmode");
+    const useLibpqCompat = parsed.searchParams.get("uselibpqcompat") === "true";
+
+    if (sslmode && ["prefer", "require", "verify-ca"].includes(sslmode) && !useLibpqCompat) {
+      // Default to the current stronger behavior and avoid pg warning noise.
+      parsed.searchParams.set("sslmode", "verify-full");
+      return { normalizedUrl: parsed.toString(), useInsecureTlsFallback: false };
+    }
+
+    return {
+      normalizedUrl: parsed.toString(),
+      // Explicitly opt into libpq-compatible "require" behavior when requested.
+      useInsecureTlsFallback: sslmode === "require" && useLibpqCompat,
+    };
+  } catch {
+    // Keep original URL if parsing fails; pg will surface a descriptive error.
+    return { normalizedUrl: rawUrl, useInsecureTlsFallback: false };
+  }
+}
+
 const initDb = async () => {
   const dbUrl = process.env.DATABASE_URL;
 
   if (dbUrl) {
     try {
+      const { normalizedUrl, useInsecureTlsFallback } = normalizeDatabaseUrlForPg(dbUrl);
       const pool = new pg.Pool({
-        connectionString: dbUrl,
-        ssl: dbUrl.includes("sslmode=require") ? { rejectUnauthorized: false } : false,
+        connectionString: normalizedUrl,
+        ...(useInsecureTlsFallback ? { ssl: { rejectUnauthorized: false } } : {}),
       });
       await pool.query("SELECT NOW()");
       dbType = "PostgreSQL (AlloyDB)";
