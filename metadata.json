@@ -1,0 +1,5 @@
+{
+  "name": "VitalFlow",
+  "description": "A post-surgical recovery management orchestrator that coordinates clinical analysis and logistics for patients.",
+  "requestFramePermissions": []
+}
