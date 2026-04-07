@@ -10,14 +10,10 @@ import {
   Cpu, 
   CheckCircle2,
   History,
-  Info,
   Terminal,
   Zap,
   Clock,
-  LayoutDashboard,
-  FileText,
-  ListTodo,
-  ArrowRight
+  FileText
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import Markdown from "react-markdown";
@@ -101,6 +97,7 @@ const tools = [
     ]
   }
 ];
+const LOG_POLL_INTERVAL_MS = 5000;
 
 interface Message {
   role: "user" | "model";
@@ -260,17 +257,26 @@ export default function App() {
     };
 
     const init = () => {
-      fetchHealth();
-      fetchLogs();
-      fetchProtocol();
-      fetchCalendar();
+      void Promise.all([fetchHealth(), fetchLogs(), fetchProtocol(), fetchCalendar()]);
+    };
+    const fetchLogsIfVisible = () => {
+      if (document.visibilityState === "visible") {
+        void fetchLogs();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void fetchLogs();
+      }
     };
 
     init();
-    const interval = setInterval(() => {
-      fetchLogs();
-    }, 5000);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchLogsIfVisible, LOG_POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, []);
 
   const handleSend = async () => {
@@ -416,7 +422,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto custom-scrollbar">
+        <div className="flex-1 overflow-y-auto">
           {/* Patient Context */}
           <section className="p-6 border-b border-white/5">
             <h2 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">Patient Identity</h2>
@@ -611,7 +617,7 @@ export default function App() {
           <h2 className="font-bold tracking-tight uppercase text-[10px] text-slate-500 tracking-widest">Clinical Audit Feed</h2>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
           {/* Patient History */}
           <ContextCard 
             title="Patient History" 
