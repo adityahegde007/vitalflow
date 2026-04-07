@@ -147,7 +147,6 @@ export default function App() {
   const [calendarError, setCalendarError] = useState<string | null>(null);
   const [logs, setLogs] = useState<ActionLog[]>([]);
   const [logsError, setLogsError] = useState<string | null>(null);
-  const [systemLogs, setSystemLogs] = useState<string[]>([]);
   const [activeAgent, setActiveAgent] = useState<Persona>("ORCHESTRATOR");
   const [activeTab, setActiveTab] = useState<Persona>("ORCHESTRATOR");
 
@@ -161,7 +160,7 @@ export default function App() {
   const chat = useMemo(() => {
     if (isApiKeyMissing) return null;
     return ai.chats.create({
-      model: "gemini-2.0-flash",
+      model: "gemini-3-flash-preview",
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
         tools: tools
@@ -261,28 +260,16 @@ export default function App() {
       }
     };
 
-    const fetchSystemLogs = async () => {
-      try {
-        const res = await fetch("/api/system-logs");
-        if (res.ok) {
-          const data = await res.json();
-          setSystemLogs(data.logs || []);
-        }
-      } catch (e) {}
-    };
-
     const init = () => {
       fetchHealth();
       fetchLogs();
       fetchProtocol();
       fetchCalendar();
-      fetchSystemLogs();
     };
 
     init();
     const interval = setInterval(() => {
       fetchLogs();
-      fetchSystemLogs();
     }, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -302,32 +289,9 @@ export default function App() {
     setActiveAgent("ORCHESTRATOR");
 
     try {
-      let response;
+      if (!chat) throw new Error("401: Gemini API Key is missing or invalid. Please set GEMINI_API_KEY in Settings.");
       
-      // Check if we should use Vertex AI backend
-      const useVertex = !!import.meta.env.VITE_USE_VERTEX || isApiKeyMissing;
-      
-      if (useVertex) {
-        setActiveAgent("ORCHESTRATOR");
-        const res = await fetch("/api/chat/vertex", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: input,
-            history: messages.map(m => ({ role: m.role, content: m.text })),
-            system_instruction: SYSTEM_INSTRUCTION
-          })
-        });
-        
-        if (!res.ok) {
-          const errorData = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new Error(errorData.detail || `Vertex AI Error: ${res.statusText}`);
-        }
-        response = await res.json();
-      } else {
-        if (!chat) throw new Error("401: Gemini API Key is missing or invalid.");
-        response = await chat.sendMessage({ message: input });
-      }
+      let response = await chat.sendMessage({ message: input });
       
       let functionCalls = response.functionCalls;
       while (functionCalls) {
@@ -364,6 +328,7 @@ export default function App() {
           return { name: call.name, response: result };
         }));
 
+        if (!chat) throw new Error("Chat session lost.");
         response = await chat.sendMessage({
           message: toolResults.map(r => ({
             functionResponse: { name: r.name, response: r.response }
@@ -437,86 +402,89 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#F8F9FA] text-[#1A1A1A] font-sans">
+    <div className="flex h-screen overflow-hidden bg-[#F1F5F9] text-[#0F172A] font-sans">
       {/* Sidebar - Technical Control Panel */}
-      <aside className="w-80 border-r border-gray-200 flex flex-col bg-white shrink-0 shadow-sm">
-        <div className="p-6 border-b border-gray-100">
+      <aside className="w-80 border-r border-slate-200 flex flex-col bg-[#1E293B] text-white shrink-0 shadow-2xl z-20">
+        <div className="p-6 border-b border-white/5">
           <div className="flex items-center gap-3 mb-2">
-            <div className="p-2 bg-blue-600 rounded-lg">
+            <div className="p-2 bg-blue-600 rounded-xl shadow-lg shadow-blue-500/20">
               <Activity className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h1 className="font-bold tracking-tight text-xl">VitalFlow</h1>
-              <p className="text-[10px] font-mono text-gray-400 uppercase tracking-widest">Care Orchestration 2.5</p>
+              <h1 className="font-bold tracking-tight text-xl text-white">VitalFlow</h1>
+              <p className="text-[10px] font-mono text-blue-400 uppercase tracking-widest">Care Orchestration 2.5</p>
             </div>
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto custom-scrollbar">
           {/* Patient Context */}
-          <section className="p-6 border-b border-gray-100">
-            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Patient Identity</h2>
-            <div className="flex items-center gap-4 p-4 rounded-xl bg-gray-50 border border-gray-100">
-              <div className="w-12 h-12 rounded-full bg-white shadow-sm flex items-center justify-center text-gray-600">
+          <section className="p-6 border-b border-white/5">
+            <h2 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">Patient Identity</h2>
+            <div className="flex items-center gap-4 p-4 rounded-xl bg-white/5 border border-white/10 backdrop-blur-sm">
+              <div className="w-12 h-12 rounded-full bg-white/10 shadow-inner flex items-center justify-center text-blue-400">
                 <User className="w-6 h-6" />
               </div>
               <div>
-                <p className="text-[10px] font-mono text-gray-400">Active Session ID</p>
-                <p className="font-mono font-bold text-lg">{patientId || "---"}</p>
+                <p className="text-[10px] font-mono text-slate-500">Active Session ID</p>
+                <p className="font-mono font-bold text-lg text-white">{patientId || "---"}</p>
               </div>
             </div>
           </section>
 
+          {/* Agent Dispatch Monitor */}
+          <section className="p-6 border-b border-white/5">
+            <h2 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">Active Dispatch</h2>
+            <div className="space-y-2">
+              <AgentNode label="Orchestrator" active={activeAgent === "ORCHESTRATOR"} color="bg-blue-600" />
+              <AgentNode label="Clinical Analyst" active={activeAgent === "CLINICAL_ANALYST"} color="bg-emerald-600" />
+              <AgentNode label="Logistics Officer" active={activeAgent === "LOGISTICS_OFFICER"} color="bg-amber-600" />
+            </div>
+          </section>
+
           {/* System Status */}
-          <section className="p-6 border-b border-gray-100">
-            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Core Systems</h2>
+          <section className="p-6">
+            <h2 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4">Core Systems</h2>
             <div className="space-y-3">
               <StatusItem 
                 icon={<Database className="w-4 h-4" />} 
                 label="AlloyDB" 
                 status={systemStatus.db} 
                 subtext={systemStatus.dbType}
+                dark
               />
-              <StatusItem icon={<Cpu className="w-4 h-4" />} label="Gemini 3.0" status={systemStatus.ai} />
-              <StatusItem icon={<Calendar className="w-4 h-4" />} label="MCP Calendar" status={systemStatus.calendar} />
-            </div>
-          </section>
-
-          {/* Agent Dispatch Monitor */}
-          <section className="p-6">
-            <h2 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-4">Active Dispatch</h2>
-            <div className="space-y-2">
-              <AgentNode label="Orchestrator" active={activeAgent === "ORCHESTRATOR"} />
-              <AgentNode label="Clinical Analyst" active={activeAgent === "CLINICAL_ANALYST"} />
-              <AgentNode label="Logistics Officer" active={activeAgent === "LOGISTICS_OFFICER"} />
+              <StatusItem icon={<Cpu className="w-4 h-4" />} label="Gemini 3.0" status={systemStatus.ai} dark />
+              <StatusItem icon={<Calendar className="w-4 h-4" />} label="MCP Calendar" status={systemStatus.calendar} dark />
             </div>
           </section>
         </div>
 
-        <div className="p-6 border-t border-gray-100 bg-gray-50">
-          <div className="flex items-center gap-2 text-[10px] text-gray-400 font-mono">
-            <ShieldCheck className="w-3 h-3" />
+        <div className="p-6 border-t border-white/5 bg-black/10">
+          <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono">
+            <ShieldCheck className="w-3 h-3 text-emerald-500" />
             <span>HIPAA COMPLIANT MODE</span>
           </div>
         </div>
       </aside>
 
       {/* Main Content - Persona Tabs & Chat */}
-      <main className="flex-1 flex flex-col min-w-0 bg-white">
+      <main className="flex-1 flex flex-col min-w-0 bg-[#F1F5F9]">
         {/* Persona Tabs */}
-        <div className="flex border-b border-gray-100 bg-gray-50/50">
+        <div className="flex border-b border-slate-200 bg-white/80 backdrop-blur-md sticky top-0 z-10">
           {(Object.keys(personaDetails) as Persona[]).map((p) => (
             <button
               key={p}
               onClick={() => setActiveTab(p)}
-              className={`flex-1 py-4 px-6 text-sm font-medium transition-all border-b-2 flex items-center justify-center gap-2 ${
+              className={`flex-1 py-4 px-6 text-sm font-bold transition-all border-b-2 flex items-center justify-center gap-2 ${
                 activeTab === p 
-                  ? "border-blue-600 text-blue-600 bg-white shadow-[0_-4px_0_0_inset_white]" 
-                  : "border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+                  ? `border-blue-600 text-blue-600 bg-white shadow-[0_-4px_0_0_inset_white]` 
+                  : "border-transparent text-slate-400 hover:text-slate-600 hover:bg-slate-50"
               }`}
             >
-              {personaDetails[p].icon}
-              <span className="hidden sm:inline">{personaDetails[p].title.split(" ")[0]}</span>
+              <span className={activeTab === p ? "text-blue-600" : "text-slate-400"}>
+                {personaDetails[p].icon}
+              </span>
+              <span className="hidden sm:inline">{personaDetails[p].title}</span>
             </button>
           ))}
         </div>
@@ -525,29 +493,28 @@ export default function App() {
           <div className="bg-amber-50 border-b border-amber-100 p-3 flex items-center gap-3 text-amber-800 text-xs font-medium">
             <AlertCircle className="w-4 h-4 text-amber-500" />
             <span>
-              Gemini API Key missing. Using Vertex AI backend fallback. 
-              <span className="ml-1 font-normal opacity-75">Ensure Vertex AI API is enabled in your Google Cloud Project.</span>
+              Gemini API Key missing. Please set GEMINI_API_KEY in Settings.
             </span>
           </div>
         )}
 
         {/* Persona Responsibilities Header */}
-        <div className="p-6 bg-white border-b border-gray-100">
-          <div className="flex items-start justify-between">
+        <div className="p-6 bg-white border-b border-slate-200">
+          <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-xl font-bold flex items-center gap-2">
+              <h2 className="text-lg font-bold flex items-center gap-2">
                 {personaDetails[activeTab].icon}
                 {personaDetails[activeTab].title}
               </h2>
-              <p className="text-sm text-gray-500 mt-1">System Responsibilities & Active Protocol</p>
+              <p className="text-[10px] text-slate-400 uppercase tracking-widest mt-0.5">Active Protocol & Responsibilities</p>
             </div>
             <div className={`px-3 py-1 rounded-full text-[10px] font-bold text-white uppercase tracking-widest ${personaDetails[activeTab].color}`}>
               {activeTab === activeAgent ? "Processing" : "Standby"}
             </div>
           </div>
-          <div className="grid grid-cols-2 gap-4 mt-4">
+          <div className="flex flex-wrap gap-x-6 gap-y-2 mt-3">
             {personaDetails[activeTab].responsibilities.map((r, i) => (
-              <div key={i} className="flex items-center gap-2 text-xs text-gray-600">
+              <div key={i} className="flex items-center gap-2 text-[10px] text-slate-500">
                 <CheckCircle2 className="w-3 h-3 text-blue-500" />
                 {r}
               </div>
@@ -558,7 +525,7 @@ export default function App() {
         {/* Message Area */}
         <div 
           ref={scrollRef}
-          className="flex-1 overflow-y-auto p-8 space-y-8 bg-[#F8F9FA]/50"
+          className="flex-1 overflow-y-auto p-6 space-y-6"
         >
           <AnimatePresence initial={false}>
             {messages.map((msg, idx) => (
@@ -645,13 +612,13 @@ export default function App() {
       </main>
 
       {/* Right Sidebar - Live Context Feed */}
-      <aside className="w-96 flex flex-col bg-gray-50 shrink-0 border-l border-gray-200">
-        <header className="h-16 border-b border-gray-200 flex items-center px-6 bg-white">
-          <History className="w-4 h-4 mr-2 text-gray-400" />
-          <h2 className="font-bold tracking-tight uppercase text-xs text-gray-500">Clinical Audit Feed</h2>
+      <aside className="w-96 flex flex-col bg-[#F1F5F9] shrink-0 border-l border-slate-200">
+        <header className="h-16 border-b border-slate-200 flex items-center px-6 bg-white">
+          <History className="w-4 h-4 mr-2 text-slate-400" />
+          <h2 className="font-bold tracking-tight uppercase text-[10px] text-slate-500 tracking-widest">Clinical Audit Feed</h2>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
           {/* Patient History */}
           <ContextCard 
             title="Patient History" 
@@ -678,10 +645,30 @@ export default function App() {
             ) : null}
           />
 
+          {/* Calendar Availability */}
+          <ContextCard 
+            title="Calendar Availability" 
+            icon={<Calendar className="w-4 h-4" />} 
+            mcp="CALENDAR"
+            content={calendarSlots.length > 0 ? (
+              <div className="space-y-2">
+                {calendarSlots.map((slot, i) => (
+                  <div key={i} className="flex items-center gap-2 text-[10px] p-2 bg-blue-50/50 rounded-lg border border-blue-100/50 text-blue-700">
+                    <Clock className="w-3 h-3" />
+                    {slot}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          />
+
           {/* Audit Trail */}
           <section className="space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Audit Trail</h3>
+              <div>
+                <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Global Audit Trail</h3>
+                <p className="text-[8px] text-gray-400 mt-0.5 italic">System-wide clinical events</p>
+              </div>
               <span className="text-[9px] font-mono text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">LIVE</span>
             </div>
             <div className="space-y-3">
@@ -732,31 +719,33 @@ const ContextCard: React.FC<{ title: string, icon: React.ReactNode, mcp: string,
   </div>
 );
 
-const StatusItem: React.FC<{ icon: React.ReactNode, label: string, status: string, subtext?: string }> = ({ icon, label, status, subtext }) => (
-  <div className="flex items-center justify-between p-3 rounded-xl border border-gray-50 bg-white shadow-sm">
+const StatusItem: React.FC<{ icon: React.ReactNode, label: string, status: string, subtext?: string, dark?: boolean }> = ({ icon, label, status, subtext, dark }) => (
+  <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
+    dark ? "bg-white/5 border-white/10 text-white" : "bg-white border-gray-100 text-gray-700 shadow-sm"
+  }`}>
     <div className="flex items-center gap-3">
-      <div className="text-gray-400">{icon}</div>
+      <div className={dark ? "text-blue-400" : "text-gray-400"}>{icon}</div>
       <div>
-        <p className="text-xs font-bold text-gray-700">{label}</p>
-        {subtext && <p className="text-[9px] font-mono text-gray-400 mt-0.5 truncate max-w-[120px]">{subtext}</p>}
+        <p className="text-xs font-bold">{label}</p>
+        {subtext && <p className={`text-[9px] font-mono mt-0.5 truncate max-w-[120px] ${dark ? "text-gray-500" : "text-gray-400"}`}>{subtext}</p>}
       </div>
     </div>
     <div className={`w-2 h-2 rounded-full ${
-      status === "online" ? "bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]" : 
+      status === "online" ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : 
       status === "checking" ? "bg-blue-500 animate-pulse" : "bg-red-500"
     }`}></div>
   </div>
 );
 
-const AgentNode: React.FC<{ label: string, active: boolean }> = ({ label, active }) => (
+const AgentNode: React.FC<{ label: string, active: boolean, color: string }> = ({ label, active, color }) => (
   <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
-    active ? "border-blue-200 bg-blue-50 shadow-sm" : "border-gray-50 bg-white opacity-50"
+    active ? `border-white/20 ${color} shadow-lg` : "border-white/5 bg-white/5 opacity-60"
   }`}>
     <div className="flex items-center gap-3">
-      <div className={`w-2 h-2 rounded-full ${active ? "bg-blue-600 animate-pulse" : "bg-gray-300"}`}></div>
-      <span className="text-[10px] font-bold uppercase tracking-widest text-gray-700">{label}</span>
+      <div className={`w-2 h-2 rounded-full ${active ? "bg-white animate-pulse shadow-[0_0_8px_white]" : "bg-slate-600"}`}></div>
+      <span className={`text-[10px] font-bold uppercase tracking-widest ${active ? "text-white" : "text-slate-400"}`}>{label}</span>
     </div>
-    {active && <Zap className="w-3 h-3 text-blue-600" />}
+    {active && <Zap className="w-3 h-3 text-white" />}
   </div>
 );
 

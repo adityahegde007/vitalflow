@@ -6,16 +6,21 @@
 }
 
 :root {
-  --bg: #E4E3E0;
-  --ink: #141414;
-  --line: #141414;
-  --accent: #2563eb;
+  --bg: #F8FAFC;
+  --sidebar-bg: #1E293B;
+  --card-bg: #FFFFFF;
+  --ink: #0F172A;
+  --line: #E2E8F0;
+  --accent: #3B82F6;
+  --accent-clinical: #10B981;
+  --accent-logistics: #F59E0B;
 }
 
 body {
   background-color: var(--bg);
   color: var(--ink);
   font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
 }
 
 /* Technical Dashboard Grid Patterns */

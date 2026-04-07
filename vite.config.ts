@@ -19,11 +19,6 @@ export default defineConfig(({mode}) => {
       port: 3000,
       host: '0.0.0.0',
       hmr: process.env.DISABLE_HMR !== 'true',
-      proxy: {
-        '/api': 'http://localhost:8001',
-        '/healthz': 'http://localhost:8001',
-        '/system-logs': 'http://localhost:8001',
-      },
     },
   };
 });
