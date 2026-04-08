@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
   Activity, 
   Calendar, 
@@ -17,114 +17,25 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import Markdown from "react-markdown";
-import { GoogleGenAI, Type } from "@google/genai";
+ 
 
-// 1. Orchestrator Configuration
-const SYSTEM_INSTRUCTION = `
-### ROLE
-You are the "VitalFlow Care Orchestrator," a Multi-Agent Primary Coordinator built for the Google GenAI Academy APAC 2026. Your mission is to manage post-surgical recovery by coordinating sub-agents and tools via MCP.
-
-### ARCHITECTURE (Separation of Concerns)
-1. CLINICAL ANALYST (Sub-Agent): Queries the 'Recovery_Protocols' (via get_recovery_protocol) and 'Patient_History' (via get_patient_history).
-2. LOGISTICS OFFICER (Sub-Agent): Executes actions. Manages 'Follow-up_Appointments' (via check_calendar) and 'Daily_Tasks' (via update_patient_task).
-
-### OPERATIONAL WORKFLOW
-- PHASE 1 (Assessment): When a patient provides an update, immediately invoke the CLINICAL ANALYST to cross-reference symptoms with AlloyDB records (via get_patient_history) and stored recovery notes (via get_recovery_protocol). You MUST call these tools first.
-- PHASE 2 (Memory & Context): If the user asks about previous symptoms, logs, or "what happened before," you MUST use the 'get_action_logs' tool to retrieve the patient's history from the database. This is your primary memory mechanism.
-- PHASE 3 (Decision): 
-    - If symptoms are "NORMAL": Reassure the patient and log the status in AlloyDB.
-    - If symptoms are "CONCERNING": Invoke the LOGISTICS OFFICER to find the next available slot in the Service Account Calendar and create a Nurse-Alert task.
-- PHASE 4 (Audit): Every action, tool call, and decision MUST be logged as a structured entry in the 'action_logs' table in AlloyDB.
-
-### MOCK DATA CONSTRAINTS (For Jury Demo)
-- Only process Patient IDs 100-110.
-- If no Patient ID is provided, ask: "Please provide your Patient ID to begin your recovery check-in."
-
-### SAFETY OVERRIDE
-If the patient mentions "Chest Pain," "Shortness of Breath," or "Heavy Bleeding," immediately stop all tool processing and output: "CRITICAL ALARM: Contact Emergency Services (102) immediately. Your care team has been notified."
-`;
-
-const tools = [
-  {
-    functionDeclarations: [
-      {
-        name: "check_calendar",
-        description: "Checks the Service Account Calendar for available follow-up appointment slots.",
-        parameters: { type: Type.OBJECT, properties: {} }
-      },
-      {
-        name: "get_recovery_protocol",
-        description: "Reads the post-surgical recovery protocols from the clinical notes.",
-        parameters: { type: Type.OBJECT, properties: {} }
-      },
-      {
-        name: "get_patient_history",
-        description: "Retrieves the patient's surgical history and past records from AlloyDB.",
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            patient_id: { type: Type.STRING, description: "The ID of the patient (100-110)." }
-          },
-          required: ["patient_id"]
-        }
-      },
-      {
-        name: "get_action_logs",
-        description: "Retrieves the most recent action logs for a specific patient from AlloyDB. Use this to 'remember' what the patient previously reported.",
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            patient_id: { type: Type.STRING, description: "The ID of the patient (100-110)." },
-            limit: { type: Type.NUMBER, description: "Number of logs to retrieve (default 5)." }
-          },
-          required: ["patient_id"]
-        }
-      },
-      {
-        name: "update_patient_task",
-        description: "Logs an action or updates a patient task in the AlloyDB system.",
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            patient_id: { type: Type.STRING, description: "The ID of the patient (100-110)." },
-            task: { type: Type.STRING, description: "The action or task being logged." },
-            status: { type: Type.STRING, description: "The status of the action (e.g., NORMAL, CONCERNING, LOGGED)." },
-            details: { type: Type.STRING, description: "Additional details about the assessment or action." }
-          },
-          required: ["patient_id", "task", "status", "details"]
-        }
-      }
-    ]
-  }
-];
-const LOG_POLL_INTERVAL_MS = 5000;
-
-interface Message {
-  role: "user" | "model";
-  text: string;
-  isCritical?: boolean;
-  timestamp: string;
+function extractPatientId(text: string): string | null {
+  const explicit = text.match(/patient(?:\s*id)?\s*[:#-]?\s*(\d{1,6})/i);
+  if (explicit) return explicit[1];
+  const fallback = text.match(/\b(\d{1,6})\b/);
+  return fallback ? fallback[1] : null;
 }
 
-interface ActionLog {
-  id: number;
-  patient_id: string;
-  action: string;
-  status: string;
-  details: string;
-  created_at: string;
-}
+import type { Message, ActionLog, Persona } from "./types";
+import { ContextCard } from "./components/ContextCard";
+import { StatusItem } from "./components/StatusItem";
+import { AgentNode } from "./components/AgentNode";
+import { QuickAction } from "./components/QuickAction";
+import { PresentationView } from "./components/PresentationView";
 
-type Persona = "ORCHESTRATOR" | "CLINICAL_ANALYST" | "LOGISTICS_OFFICER";
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "model",
-      text: "VITALFLOW SYSTEM ONLINE. Waiting for Patient ID to begin recovery assessment.",
-      timestamp: new Date().toLocaleTimeString(),
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [patientId, setPatientId] = useState<string | null>(null);
@@ -147,22 +58,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Persona>("ORCHESTRATOR");
 
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  // 2. Initialize Gemini SDK
-  const apiKey = process.env.GEMINI_API_KEY;
-  const isApiKeyMissing = !apiKey || apiKey === "undefined";
-
-  const ai = useMemo(() => new GoogleGenAI({ apiKey: apiKey || "" }), [apiKey]);
-  const chat = useMemo(() => {
-    if (isApiKeyMissing) return null;
-    return ai.chats.create({
-      model: "gemini-3-flash-preview",
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        tools: tools
-      }
-    });
-  }, [ai, isApiKeyMissing]);
+  const runStreamRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -259,32 +155,52 @@ export default function App() {
     const init = () => {
       void Promise.all([fetchHealth(), fetchLogs(), fetchProtocol(), fetchCalendar()]);
     };
-    const fetchLogsIfVisible = () => {
-      if (document.visibilityState === "visible") {
-        void fetchLogs();
-      }
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        void fetchLogs();
-      }
-    };
 
     init();
-    const interval = setInterval(fetchLogsIfVisible, LOG_POLL_INTERVAL_MS);
-    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    const logStream = new EventSource("/api/stream/logs");
+    logStream.addEventListener("logs", (event) => {
+      try {
+        const nextLogs = JSON.parse((event as MessageEvent).data) as ActionLog[];
+        setLogs(nextLogs);
+        setLogsError(null);
+      } catch {
+        setLogsError("Stream parse error.");
+      }
+    });
+    logStream.addEventListener("calendar", (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as { availability?: string[] };
+        if (Array.isArray(payload.availability)) {
+          setCalendarSlots(payload.availability);
+          setCalendarError(null);
+        }
+      } catch {
+        setCalendarError("Calendar stream parse error.");
+      }
+    });
+    logStream.addEventListener("error", () => {
+      setLogsError("Realtime stream disconnected. Retrying...");
+    });
+
     return () => {
-      clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      logStream.close();
+      if (runStreamRef.current) {
+        runStreamRef.current.close();
+        runStreamRef.current = null;
+      }
     };
   }, []);
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
+    const messageText = input.trim();
+    const extractedId = extractPatientId(messageText);
+    if (extractedId) setPatientId(extractedId);
 
     const userMessage: Message = { 
       role: "user", 
-      text: input, 
+      text: messageText, 
       timestamp: new Date().toLocaleTimeString() 
     };
     
@@ -292,84 +208,109 @@ export default function App() {
     setInput("");
     setIsLoading(true);
     setActiveAgent("ORCHESTRATOR");
+    setActiveTab("ORCHESTRATOR");
 
     try {
-      if (!chat) throw new Error("401: Gemini API Key is missing or invalid. Please set GEMINI_API_KEY in Settings.");
-      
-      let response = await chat.sendMessage({ message: input });
-      
-      let functionCalls = response.functionCalls;
-      while (functionCalls) {
-        const toolResults = await Promise.all(functionCalls.map(async (call) => {
-          let result;
-          if (call.name === "check_calendar") {
-            setActiveAgent("LOGISTICS_OFFICER");
-            const res = await fetch("/api/tools/calendar");
-            result = await res.json();
-            if (result.availability) setCalendarSlots(result.availability);
-          } else if (call.name === "get_recovery_protocol") {
-            setActiveAgent("CLINICAL_ANALYST");
-            const res = await fetch("/api/tools/protocol");
-            result = await res.json();
-            if (result.protocol) setProtocol(result.protocol);
-          } else if (call.name === "get_patient_history") {
-            setActiveAgent("CLINICAL_ANALYST");
-            const res = await fetch(`/api/tools/patient-history/${call.args.patient_id}`);
-            result = await res.json();
-            setPatientHistory(result);
-          } else if (call.name === "get_action_logs") {
-            setActiveAgent("ORCHESTRATOR");
-            const res = await fetch(`/api/tools/action-logs/${call.args.patient_id}?limit=${call.args.limit || 5}`);
-            result = await res.json();
-          } else if (call.name === "update_patient_task") {
-            setActiveAgent("LOGISTICS_OFFICER");
-            const res = await fetch("/api/tools/log-task", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(call.args)
-            });
-            result = await res.json();
-          }
-          return { name: call.name, response: result };
-        }));
-
-        if (!chat) throw new Error("Chat session lost.");
-        response = await chat.sendMessage({
-          message: toolResults.map(r => ({
-            functionResponse: { name: r.name, response: r.response }
-          })) as any 
-        });
-        functionCalls = response.functionCalls;
+      if (runStreamRef.current) {
+        runStreamRef.current.close();
+        runStreamRef.current = null;
       }
 
-      const modelText = response.text || "I'm sorry, I couldn't process that.";
-      const isCritical = modelText.includes("CRITICAL ALARM");
+      const orchestrateRes = await fetch("/api/orchestrate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: messageText,
+          patient_id: extractedId || patientId || undefined
+        })
+      });
 
-      const idMatch = input.match(/\b(10[0-9]|110)\b/);
-      if (idMatch) setPatientId(idMatch[0]);
+      const orchestrateData = await orchestrateRes.json().catch(() => ({}));
+      if (!orchestrateRes.ok || !orchestrateData.run_id) {
+        throw new Error(orchestrateData.error || `Failed to start orchestration (${orchestrateRes.status})`);
+      }
 
-      setMessages((prev) => [...prev, { 
-        role: "model", 
-        text: modelText, 
-        isCritical,
-        timestamp: new Date().toLocaleTimeString()
-      }]);
-      setActiveAgent("ORCHESTRATOR");
+      const runStream = new EventSource(`/api/stream/runs/${orchestrateData.run_id}`);
+      runStreamRef.current = runStream;
+
+      runStream.addEventListener("run_event", (event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as any;
+          const agent = payload.agent as Persona | undefined;
+          if (agent) {
+            setActiveAgent(agent);
+          }
+
+          const data = payload.data || {};
+          if (data.patient_id) setPatientId(String(data.patient_id));
+          if (data.patient_history) setPatientHistory(data.patient_history);
+
+          if (payload.type === "completed") {
+            const modelText = data.final_text || "Orchestration completed.";
+            setMessages((prev) => [...prev, {
+              role: "model",
+              text: modelText,
+              isCritical: !!data.is_critical,
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+            setIsLoading(false);
+            setActiveAgent("ORCHESTRATOR");
+            runStream.close();
+            runStreamRef.current = null;
+          }
+
+          if (payload.type === "error") {
+            const errText = data.error || "Orchestration failed.";
+            setMessages((prev) => [...prev, {
+              role: "model",
+              text: `ORCHESTRATION ERROR: ${errText}`,
+              timestamp: new Date().toLocaleTimeString()
+            }]);
+            setIsLoading(false);
+            setActiveAgent("ORCHESTRATOR");
+            runStream.close();
+            runStreamRef.current = null;
+          }
+        } catch {
+          setMessages((prev) => [...prev, {
+            role: "model",
+            text: "ORCHESTRATION ERROR: Invalid run event payload.",
+            timestamp: new Date().toLocaleTimeString()
+          }]);
+          setIsLoading(false);
+          setActiveAgent("ORCHESTRATOR");
+          runStream.close();
+          runStreamRef.current = null;
+        }
+      });
+
+      runStream.addEventListener("error", () => {
+        if (runStream.readyState === EventSource.CLOSED && isLoading) {
+          setMessages((prev) => [...prev, {
+            role: "model",
+            text: "ORCHESTRATION ERROR: Run stream disconnected.",
+            timestamp: new Date().toLocaleTimeString()
+          }]);
+          setIsLoading(false);
+          setActiveAgent("ORCHESTRATOR");
+        }
+      });
     } catch (error: any) {
-      const errorMessage = error.message?.includes("401") 
-        ? "AUTHENTICATION ERROR (401): Gemini API Key is missing or invalid. Please check your environment variables."
-        : "ORCHESTRATION ERROR: Unable to process clinical reasoning.";
+      const errorMessage = `ORCHESTRATION ERROR: ${error.message || "Unable to process orchestration."}`;
       
       setMessages((prev) => [...prev, { 
         role: "model", 
         text: errorMessage,
         timestamp: new Date().toLocaleTimeString()
       }]);
-    } finally {
       setIsLoading(false);
+      setActiveAgent("ORCHESTRATOR");
+      if (runStreamRef.current) {
+        runStreamRef.current.close();
+        runStreamRef.current = null;
+      }
     }
   };
-
   const personaDetails = {
     ORCHESTRATOR: {
       title: "VitalFlow Orchestrator",
@@ -403,6 +344,17 @@ export default function App() {
         "Handles data persistence in AlloyDB"
       ],
       color: "bg-amber-600"
+    },
+    PITCH_DECK: {
+      title: "Deck",
+      icon: <Cpu className="w-5 h-5" />,
+      responsibilities: [
+        "Executive summary of the VitalFlow engine",
+        "Architectural deep-dive and technology stack",
+        "Multi-agent methodology and USP",
+        "Real-time capability demonstration"
+      ],
+      color: "bg-purple-600"
     }
   };
 
@@ -444,6 +396,7 @@ export default function App() {
               <AgentNode label="Orchestrator" active={activeAgent === "ORCHESTRATOR"} color="bg-blue-600" />
               <AgentNode label="Clinical Analyst" active={activeAgent === "CLINICAL_ANALYST"} color="bg-emerald-600" />
               <AgentNode label="Logistics Officer" active={activeAgent === "LOGISTICS_OFFICER"} color="bg-amber-600" />
+              <AgentNode label="Deck" active={activeTab === "PITCH_DECK"} color="bg-purple-600" />
             </div>
           </section>
 
@@ -488,40 +441,43 @@ export default function App() {
           ))}
         </div>
 
-        {isApiKeyMissing && (
-          <div className="bg-amber-50 border-b border-amber-100 p-3 flex items-center gap-3 text-amber-800 text-xs font-medium">
-            <AlertCircle className="w-4 h-4 text-amber-500" />
-            <span>
-              Gemini API Key missing. Please set GEMINI_API_KEY in Settings.
-            </span>
+        {/* Persona Responsibilities Header */}
+        {activeTab !== "PITCH_DECK" && (
+          <div className="p-4 sm:p-6 bg-white border-b border-slate-200">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold flex items-center gap-2">
+                  {personaDetails[activeTab].icon}
+                  {personaDetails[activeTab].title}
+                </h2>
+                <p className="text-[10px] text-slate-400 uppercase tracking-widest mt-0.5">Active Protocol & Responsibilities</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <a
+                  href="/docs"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-widest border border-slate-300 text-slate-600 hover:bg-slate-100 transition-colors"
+                >
+                  API Docs
+                </a>
+                <div className={`px-3 py-1 rounded-full text-[10px] font-bold text-white uppercase tracking-widest ${personaDetails[activeTab].color}`}>
+                  {activeTab === activeAgent ? "Processing" : "Standby"}
+                </div>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-x-6 gap-y-2 mt-3">
+              {personaDetails[activeTab].responsibilities.map((r, i) => (
+                <div key={i} className="flex items-center gap-2 text-[10px] text-slate-500">
+                  <CheckCircle2 className="w-3 h-3 text-blue-500" />
+                  {r}
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
-        {/* Persona Responsibilities Header */}
-        <div className="p-4 sm:p-6 bg-white border-b border-slate-200">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-lg font-bold flex items-center gap-2">
-                {personaDetails[activeTab].icon}
-                {personaDetails[activeTab].title}
-              </h2>
-              <p className="text-[10px] text-slate-400 uppercase tracking-widest mt-0.5">Active Protocol & Responsibilities</p>
-            </div>
-            <div className={`px-3 py-1 rounded-full text-[10px] font-bold text-white uppercase tracking-widest ${personaDetails[activeTab].color}`}>
-              {activeTab === activeAgent ? "Processing" : "Standby"}
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-2 mt-3">
-            {personaDetails[activeTab].responsibilities.map((r, i) => (
-              <div key={i} className="flex items-center gap-2 text-[10px] text-slate-500">
-                <CheckCircle2 className="w-3 h-3 text-blue-500" />
-                {r}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Message Area */}
+        {activeTab === "ORCHESTRATOR" && (
         <div 
           ref={scrollRef}
           className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4 sm:space-y-6"
@@ -574,8 +530,71 @@ export default function App() {
             </div>
           )}
         </div>
+        )}
+
+        {activeTab === "CLINICAL_ANALYST" && (
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+            <ContextCard
+              title="Patient History"
+              icon={<User className="w-4 h-4" />}
+              mcp="ALLOYDB"
+              content={patientHistory ? (
+                <div className="text-sm space-y-2">
+                  <div><span className="text-slate-500">Surgery:</span> {patientHistory.surgery}</div>
+                  <div><span className="text-slate-500">Date:</span> {patientHistory.date}</div>
+                  <div><span className="text-slate-500">Complications:</span> {patientHistory.complications}</div>
+                </div>
+              ) : null}
+            />
+
+          </div>
+        )}
+
+        {activeTab === "LOGISTICS_OFFICER" && (
+          <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+            <ContextCard
+              title="Calendar Availability"
+              icon={<Calendar className="w-4 h-4" />}
+              mcp="CALENDAR"
+              content={calendarSlots.length > 0 ? (
+                <div className="space-y-2">
+                  {calendarSlots.map((slot, i) => (
+                    <div key={i} className="text-xs p-2 bg-blue-50 border border-blue-100 rounded">{slot}</div>
+                  ))}
+                </div>
+              ) : null}
+            />
+            <ContextCard
+              title="Recent Task Writes"
+              icon={<ClipboardList className="w-4 h-4" />}
+              mcp="AUDIT"
+              content={logs.length > 0 ? (
+                <div className="space-y-2">
+                  {logs.slice(0, 6).map((log) => (
+                    <div key={log.id} className="text-xs p-3 bg-white border border-slate-200 rounded flex flex-col gap-1">
+                      <div className="flex justify-between items-start">
+                        <span className="font-semibold text-slate-700">{log.action}</span>
+                        <span className="text-[9px] text-slate-400 font-mono">{new Date(log.created_at).toLocaleString()}</span>
+                      </div>
+                      <div className="text-slate-500">{log.details}</div>
+                      <div className="mt-1 flex items-center justify-between">
+                        <span className="text-[9px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded uppercase">Patient: {log.patient_id}</span>
+                        <span className="text-[9px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">{log.status}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            />
+          </div>
+        )}
+
+        {activeTab === "PITCH_DECK" && (
+          <PresentationView logs={logs} systemStatus={systemStatus} onEndPitch={() => setActiveTab("ORCHESTRATOR")} />
+        )}
 
         {/* Input Area */}
+        {activeTab === "ORCHESTRATOR" && (
         <div className="p-3 sm:p-6 bg-white border-t border-gray-100">
           <form 
             onSubmit={(e) => { e.preventDefault(); handleSend(); }} 
@@ -604,10 +623,40 @@ export default function App() {
           <div className="mt-4 flex flex-wrap gap-2">
             <QuickAction label="Check Protocol" onClick={() => setInput("What is the recovery protocol?")} />
             <QuickAction label="Check Calendar" onClick={() => setInput("Check my follow-up availability")} />
-            <QuickAction label="Log Symptom" onClick={() => setInput("I have a slight fever (Patient 101)")} />
+            <QuickAction label="Log Symptom" onClick={() => setInput("I have a slight fever. My Patient ID is ...")} />
             <QuickAction label="Recall History" onClick={() => setInput("What symptoms did I report earlier?")} />
           </div>
+          <div className="mt-3 text-[10px] text-slate-500">
+            Example demo commands:
+            <div className="mt-2 flex flex-wrap gap-2">
+              <QuickAction
+                label="Complex Recall+Plan"
+                onClick={() =>
+                  setInput(
+                    "Patient 101: I had fever and swelling yesterday. Recall my previous history and arrange follow-up."
+                  )
+                }
+              />
+              <QuickAction
+                label="Escalate & Book"
+                onClick={() =>
+                  setInput(
+                    "Patient 102: pain increased today. Check history, evaluate concern, and book earliest follow-up."
+                  )
+                }
+              />
+              <QuickAction
+                label="Add Patient Record"
+                onClick={() =>
+                  setInput(
+                    "Add patient 120 surgery: Hernia Repair date:2026-04-08 complications: Mild soreness"
+                  )
+                }
+              />
+            </div>
+          </div>
         </div>
+        )}
       </main>
 
       {/* Right Sidebar - Live Context Feed */}
@@ -632,17 +681,7 @@ export default function App() {
             ) : null}
           />
 
-          {/* Recovery Protocol */}
-          <ContextCard 
-            title="Recovery Protocol" 
-            icon={<FileText className="w-4 h-4" />} 
-            mcp="NOTES"
-            content={protocol ? (
-              <div className="prose prose-xs max-h-40 overflow-y-auto">
-                <Markdown>{protocol}</Markdown>
-              </div>
-            ) : null}
-          />
+
 
           {/* Calendar Availability */}
           <ContextCard 
@@ -676,7 +715,9 @@ export default function App() {
                   <div key={log.id} className="p-4 rounded-xl bg-white border border-gray-100 shadow-sm relative overflow-hidden group">
                     <div className="flex justify-between items-start mb-2">
                       <span className="text-[10px] font-bold text-blue-600 uppercase tracking-widest">{log.action}</span>
-                      <span className="text-[9px] text-gray-300 font-mono">{new Date(log.created_at).toLocaleTimeString()}</span>
+                      <span className="text-[9px] text-slate-700 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded font-mono">
+                        {new Date(log.created_at).toLocaleString()}
+                      </span>
                     </div>
                     <p className="text-xs text-gray-600 leading-relaxed mb-3">{log.details}</p>
                     <div className="flex items-center justify-between">
@@ -685,7 +726,9 @@ export default function App() {
                       }`}>
                         {log.status}
                       </span>
-                      <span className="text-[9px] text-gray-300 font-mono">PID: {log.patient_id}</span>
+                      <span className="text-[9px] text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded font-mono">
+                        PID: {log.patient_id}
+                      </span>
                     </div>
                   </div>
                 ))
@@ -702,57 +745,3 @@ export default function App() {
     </div>
   );
 }
-
-const ContextCard: React.FC<{ title: string, icon: React.ReactNode, mcp: string, content: React.ReactNode }> = ({ title, icon, mcp, content }) => (
-  <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-    <div className="px-4 py-3 border-b border-gray-50 flex items-center justify-between bg-gray-50/50">
-      <div className="flex items-center gap-2 text-gray-600">
-        {icon}
-        <span className="text-[10px] font-bold uppercase tracking-widest">{title}</span>
-      </div>
-      <span className="text-[8px] font-mono text-gray-400">{mcp} MCP</span>
-    </div>
-    <div className="p-4">
-      {content || <p className="text-[10px] text-gray-300 italic">No data retrieved yet.</p>}
-    </div>
-  </div>
-);
-
-const StatusItem: React.FC<{ icon: React.ReactNode, label: string, status: string, subtext?: string, dark?: boolean }> = ({ icon, label, status, subtext, dark }) => (
-  <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
-    dark ? "bg-white/5 border-white/10 text-white" : "bg-white border-gray-100 text-gray-700 shadow-sm"
-  }`}>
-    <div className="flex items-center gap-3">
-      <div className={dark ? "text-blue-400" : "text-gray-400"}>{icon}</div>
-      <div>
-        <p className="text-xs font-bold">{label}</p>
-        {subtext && <p className={`text-[9px] font-mono mt-0.5 truncate max-w-[120px] ${dark ? "text-gray-500" : "text-gray-400"}`}>{subtext}</p>}
-      </div>
-    </div>
-    <div className={`w-2 h-2 rounded-full ${
-      status === "online" ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : 
-      status === "checking" ? "bg-blue-500 animate-pulse" : "bg-red-500"
-    }`}></div>
-  </div>
-);
-
-const AgentNode: React.FC<{ label: string, active: boolean, color: string }> = ({ label, active, color }) => (
-  <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
-    active ? `border-white/20 ${color} shadow-lg` : "border-white/5 bg-white/5 opacity-60"
-  }`}>
-    <div className="flex items-center gap-3">
-      <div className={`w-2 h-2 rounded-full ${active ? "bg-white animate-pulse shadow-[0_0_8px_white]" : "bg-slate-600"}`}></div>
-      <span className={`text-[10px] font-bold uppercase tracking-widest ${active ? "text-white" : "text-slate-400"}`}>{label}</span>
-    </div>
-    {active && <Zap className="w-3 h-3 text-white" />}
-  </div>
-);
-
-const QuickAction: React.FC<{ label: string, onClick: () => void }> = ({ label, onClick }) => (
-  <button 
-    onClick={onClick}
-    className="text-[10px] font-bold uppercase tracking-wider border border-gray-200 px-3 py-1.5 rounded-lg hover:border-blue-500 hover:text-blue-600 hover:bg-blue-50 transition-all bg-white shadow-sm"
-  >
-    {label}
-  </button>
-);

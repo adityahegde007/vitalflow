@@ -1,0 +1,470 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "VitalFlow Orchestrator API",
+    "version": "1.0.0",
+    "description": "API for a primary care-orchestration agent coordinating clinical and logistics workflows with database-backed tools."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "Same-origin server"
+    }
+  ],
+  "tags": [
+    { "name": "System" },
+    { "name": "Logs" },
+    { "name": "Tools" },
+    { "name": "MCP Bridge" }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Service health",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/logs": {
+      "get": {
+        "tags": ["Logs"],
+        "summary": "Get recent global action logs",
+        "responses": {
+          "200": {
+            "description": "Recent logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ActionLog" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stream/logs": {
+      "get": {
+        "tags": ["Logs"],
+        "summary": "Realtime stream of logs and calendar updates (SSE)",
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream",
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stream/runs/{runId}": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Realtime stream for one orchestration run (SSE)",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runId",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run events stream",
+            "content": {
+              "text/event-stream": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/orchestrate": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Start backend orchestration run",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["message"],
+                "properties": {
+                  "message": { "type": "string" },
+                  "patient_id": { "type": "integer", "minimum": 1, "maximum": 999999 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted orchestration run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "run_id": { "type": "string" },
+                    "patient_id": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mcp/tools/list": {
+      "get": {
+        "tags": ["MCP Bridge"],
+        "summary": "List MCP-compatible tools and schemas",
+        "responses": {
+          "200": {
+            "description": "Tool registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "protocol": { "type": "string" },
+                    "tools": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "description": { "type": "string" },
+                          "input_schema": { "type": "object" },
+                          "output_schema": { "type": "object" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/mcp/tools/call": {
+      "post": {
+        "tags": ["MCP Bridge"],
+        "summary": "Invoke a tool through MCP-compatible call envelope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["tool_name"],
+                "properties": {
+                  "call_id": { "type": "string" },
+                  "tool_name": { "type": "string" },
+                  "arguments": { "type": "object" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tool call success envelope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "call_id": { "type": "string" },
+                    "tool_name": { "type": "string" },
+                    "timestamp": { "type": "string", "format": "date-time" },
+                    "success": { "type": "boolean" },
+                    "result": { "type": "object" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/calendar": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get calendar availability",
+        "responses": {
+          "200": {
+            "description": "Available slots",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "availability": {
+                      "type": "array",
+                      "items": { "type": "string", "format": "date-time" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/calendar/book": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Book a follow-up slot",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BookCalendarRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Booking result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BookCalendarResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "No slots available"
+          }
+        }
+      }
+    },
+    "/api/tools/protocol": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Read recovery protocol notes",
+        "responses": {
+          "200": {
+            "description": "Protocol content",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "protocol": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "404": { "description": "Protocol not found" }
+        }
+      }
+    },
+    "/api/tools/patient-history/{patient_id}": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get patient history",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "patient_id",
+            "required": true,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 999999 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Patient history payload",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PatientHistoryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/patient-history": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Create/update patient history",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PatientHistoryUpsertRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upsert success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "patient_id": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/action-logs/{patient_id}": {
+      "get": {
+        "tags": ["Tools", "Logs"],
+        "summary": "Get action logs for one patient",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "patient_id",
+            "required": true,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 999999 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Patient logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/PatientActionLog" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/log-task": {
+      "post": {
+        "tags": ["Tools", "Logs"],
+        "summary": "Write task/action log entry",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LogTaskRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Log write result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "logged": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActionLog": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "patient_id": { "type": "string" },
+          "action": { "type": "string" },
+          "status": { "type": "string" },
+          "details": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PatientActionLog": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "action": { "type": "string" },
+          "status": { "type": "string" },
+          "result": { "type": "string" }
+        }
+      },
+      "PatientHistoryResponse": {
+        "type": "object",
+        "properties": {
+          "patient_id": { "type": "string" },
+          "surgery": { "type": "string" },
+          "date": { "type": "string" },
+          "complications": { "type": "string" }
+        }
+      },
+      "PatientHistoryUpsertRequest": {
+        "type": "object",
+        "required": ["patient_id", "surgery", "date", "complications"],
+        "properties": {
+          "patient_id": { "type": "integer", "minimum": 1, "maximum": 999999 },
+          "surgery": { "type": "string" },
+          "date": { "type": "string" },
+          "complications": { "type": "string" }
+        }
+      },
+      "LogTaskRequest": {
+        "type": "object",
+        "required": ["patient_id", "task", "status", "details"],
+        "properties": {
+          "patient_id": { "type": "integer", "minimum": 1, "maximum": 999999 },
+          "task": { "type": "string" },
+          "status": { "type": "string" },
+          "details": { "type": "string" }
+        }
+      },
+      "BookCalendarRequest": {
+        "type": "object",
+        "required": ["patient_id"],
+        "properties": {
+          "patient_id": { "type": "integer", "minimum": 1, "maximum": 999999 },
+          "preferred_slot": { "type": "string", "format": "date-time" }
+        }
+      },
+      "BookCalendarResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "booked_slot": { "type": "string", "format": "date-time" },
+          "availability": {
+            "type": "array",
+            "items": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    }
+  }
+}
